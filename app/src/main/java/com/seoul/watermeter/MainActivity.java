@@ -38,41 +38,36 @@ public class MainActivity extends AppCompatActivity {
     public static MainActivity instance;
     public final List<MeterProtocol.ParseResult> history = new ArrayList<>();
 
-    private UsbManager      usbManager;
-    private UsbSerialPort   serialPort;
-    private ExecutorService executor;
-    private final Handler   mainHandler  = new Handler(Looper.getMainLooper());
-    private final Handler   autoHandler  = new Handler(Looper.getMainLooper());
-    private Runnable        autoRunnable;
+    private UsbManager       usbManager;
+    private UsbSerialPort    serialPort;
+    private ExecutorService  executor;
+    private final Handler    mainHandler = new Handler(Looper.getMainLooper());
+    private final Handler    autoHandler = new Handler(Looper.getMainLooper());
+    private Runnable         autoRunnable;
     private volatile boolean isConnected = false;
     private volatile boolean isReading   = false;
 
-    // Fragment refs
-    private ReadFragment  readFragment;
-    private HexFragment   hexFragment;
-    private LogFragment   logFragment;
+    private ReadFragment readFragment;
+    private HexFragment  hexFragment;
+    private LogFragment  logFragment;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        instance    = this;
-        usbManager  = (UsbManager) getSystemService(Context.USB_SERVICE);
-        executor    = Executors.newSingleThreadExecutor();
-
+        instance   = this;
+        usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        executor   = Executors.newSingleThreadExecutor();
         setupViewPager();
-
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
     }
 
-    // ── ViewPager 설정 ────────────────────────────────────
     private void setupViewPager() {
         ViewPager2 vp = findViewById(R.id.viewPager);
         TabLayout  tl = findViewById(R.id.tabLayout);
-
         vp.setAdapter(new FragmentStateAdapter(this) {
             public int getItemCount() { return 3; }
             public Fragment createFragment(int pos) {
@@ -87,53 +82,39 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ── USB 연결 ──────────────────────────────────────────
-    public void sendRequest(int addr) {
-    if (!isConnected || serialPort == null) {
-        toast("먼저 연결하세요");
-        return;
-    }
-
-    byte[] frame = MeterProtocol.buildRequest(addr);
-
-    executor.execute(() -> {
-        try {
-            // 1. TX High Level 유지 (RTS=High)
-            serialPort.setRTS(true);
-            serialPort.setDTR(true);
-
-            // 2. 20~50ms 대기 (프로토콜 규정)
-            Thread.sleep(35);
-
-            // 3. 수신 버퍼 클리어
-            byte[] flush = new byte[64];
-            try { serialPort.read(flush, 30); } catch (IOException ignored) {}
-
-            // 4. Start bit 전송
-            serialPort.write(frame, 3000);
-
-            mainHandler.post(() ->
-                addLog("→ REQ_UD2 (주소 " + addr + "): "
-                    + MeterProtocol.toHex(frame), "HEX")
-            );
-
-            // 5. 전송 완료 후 0~100ms 대기
-            Thread.sleep(100);
-
-        } catch (IOException | InterruptedException e) {
-            mainHandler.post(() ->
-                addLog("전송 실패: " + e.getMessage(), "ERR")
-            );
+    public void connectUsb() {
+        List<UsbSerialDriver> drivers =
+            UsbSerialProber.getDefaultProber().findAllDrivers(usbManager);
+        if (drivers.isEmpty()) {
+            addLog("USB 장치 없음 — OTG 케이블 확인", "ERR");
+            toast("USB 장치를 찾을 수 없습니다");
+            return;
         }
-    });
-}
+        UsbDevice device = drivers.get(0).getDevice();
+        addLog("USB 감지: " + device.getProductName()
+            + " VID=" + device.getVendorId()
+            + " PID=" + device.getProductId(), "INFO");
+
+        if (!usbManager.hasPermission(device)) {
+            PendingIntent pi = PendingIntent.getBroadcast(
+                this, 0, new Intent(ACTION_USB_PERMISSION),
+                PendingIntent.FLAG_IMMUTABLE);
+            usbManager.requestPermission(device, pi);
+            addLog("USB 권한 요청 중...", "INFO");
+            return;
+        }
+        openPort(drivers.get(0));
+    }
 
     // ── 포트 열기 ─────────────────────────────────────────
     private void openPort(UsbSerialDriver driver) {
         executor.execute(() -> {
             try {
-                UsbDeviceConnection conn = usbManager.openDevice(driver.getDevice());
+                UsbDeviceConnection conn =
+                    usbManager.openDevice(driver.getDevice());
                 if (conn == null) {
-                    mainHandler.post(() -> addLog("장치 열기 실패 (권한 없음)", "ERR"));
+                    mainHandler.post(() ->
+                        addLog("장치 열기 실패 (권한 없음)", "ERR"));
                     return;
                 }
 
@@ -146,11 +127,13 @@ public class MainActivity extends AppCompatActivity {
                     UsbSerialPort.PARITY_NONE
                 );
 
-                // 포트 안정화 대기
+                // TX High Level 활성화 (프로토콜 규정)
                 port.setDTR(true);
                 port.setRTS(true);
-                Thread.sleep(50);       
-                // High level 안정화
+
+                // High Level 안정화 대기 20~50ms
+                Thread.sleep(50);
+
                 serialPort  = port;
                 isConnected = true;
 
@@ -163,7 +146,8 @@ public class MainActivity extends AppCompatActivity {
                 startReadLoop();
 
             } catch (IOException | InterruptedException e) {
-                mainHandler.post(() -> addLog("연결 실패: " + e.getMessage(), "ERR"));
+                mainHandler.post(() ->
+                    addLog("연결 실패: " + e.getMessage(), "ERR"));
             }
         });
     }
@@ -173,13 +157,11 @@ public class MainActivity extends AppCompatActivity {
         stopAutoTimer();
         isReading   = false;
         isConnected = false;
-
         UsbSerialPort p = serialPort;
         serialPort = null;
         if (p != null) {
             try { p.close(); } catch (IOException ignored) {}
         }
-
         mainHandler.post(() -> {
             if (readFragment != null) readFragment.onConnected(false);
             addLog("연결 해제", "WARN");
@@ -189,28 +171,25 @@ public class MainActivity extends AppCompatActivity {
     // ── 수신 루프 ─────────────────────────────────────────
     private void startReadLoop() {
         isReading = true;
-        byte[]   buf    = new byte[256];
-        byte[]   acc    = new byte[512];
-        int[]    accLen = {0};
+        byte[] buf    = new byte[256];
+        byte[] acc    = new byte[512];
+        int[]  accLen = {0};
 
-        // 수신 루프는 openPort executor에서 계속 실행
         while (isReading && serialPort != null) {
             try {
                 int n = serialPort.read(buf, 150);
                 if (n > 0) {
                     System.arraycopy(buf, 0, acc, accLen[0], n);
                     accLen[0] += n;
-
                     int end = MeterProtocol.findLongFrameEnd(acc, accLen[0]);
                     if (end > 0) {
                         byte[] frame = new byte[end];
                         System.arraycopy(acc, 0, frame, 0, end);
                         accLen[0] -= end;
                         System.arraycopy(acc, end, acc, 0, accLen[0]);
-
-                        MeterProtocol.ParseResult result =
+                        MeterProtocol.ParseResult r =
                             MeterProtocol.parseLongFrame(frame);
-                        mainHandler.post(() -> handleResult(result));
+                        mainHandler.post(() -> handleResult(r));
                     }
                     if (accLen[0] > 400) accLen[0] = 0;
                 }
@@ -227,23 +206,32 @@ public class MainActivity extends AppCompatActivity {
             toast("먼저 연결하세요");
             return;
         }
-
         byte[] frame = MeterProtocol.buildRequest(addr);
-
         executor.execute(() -> {
             try {
-                // 수신 버퍼 비우기
-                byte[] flush = new byte[64];
-                try { serialPort.read(flush, 50); } catch (IOException ignored) {}
+                // TX High Level 유지
+                serialPort.setRTS(true);
+                serialPort.setDTR(true);
 
-                // 전송
+                // 전송 전 High Level 대기 (20~50ms, 프로토콜 규정)
+                Thread.sleep(35);
+
+                // 수신 버퍼 클리어
+                byte[] flush = new byte[64];
+                try { serialPort.read(flush, 30); } catch (IOException ignored) {}
+
+                // 검침 요청 전송
                 serialPort.write(frame, 3000);
 
                 mainHandler.post(() ->
                     addLog("→ REQ_UD2 (주소 " + addr + "): "
                         + MeterProtocol.toHex(frame), "HEX")
                 );
-            } catch (IOException e) {
+
+                // 전송 후 대기 (0~100ms, 프로토콜 규정)
+                Thread.sleep(100);
+
+            } catch (IOException | InterruptedException e) {
                 mainHandler.post(() ->
                     addLog("전송 실패: " + e.getMessage(), "ERR")
                 );
@@ -260,7 +248,7 @@ public class MainActivity extends AppCompatActivity {
                 autoHandler.postDelayed(autoRunnable, ms);
             };
             autoHandler.postDelayed(autoRunnable, ms);
-            addLog("자동 검침: " + (ms / 1000) + "초 간격 시작", "INFO");
+            addLog("자동 검침: " + (ms / 1000) + "초 간격", "INFO");
         }
     }
 
@@ -273,10 +261,7 @@ public class MainActivity extends AppCompatActivity {
 
     // ── 결과 처리 ─────────────────────────────────────────
     public void handleResult(MeterProtocol.ParseResult r) {
-        if (!r.ok) {
-            addLog("파싱 오류: " + r.error, "ERR");
-            return;
-        }
+        if (!r.ok) { addLog("파싱 오류: " + r.error, "ERR"); return; }
         history.add(0, r);
         if (readFragment != null) readFragment.updateReading(r);
         addLog("[" + r.timestamp + "] "
@@ -301,17 +286,14 @@ public class MainActivity extends AppCompatActivity {
 
     // ── USB BroadcastReceiver ─────────────────────────────
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
-        @Override
         public void onReceive(Context ctx, Intent intent) {
             String action = intent.getAction();
             if (ACTION_USB_PERMISSION.equals(action)) {
-                boolean granted = intent.getBooleanExtra(
-                    UsbManager.EXTRA_PERMISSION_GRANTED, false);
-                if (granted) {
+                if (intent.getBooleanExtra(
+                        UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                     List<UsbSerialDriver> drivers =
                         UsbSerialProber.getDefaultProber().findAllDrivers(usbManager);
                     if (!drivers.isEmpty()) openPort(drivers.get(0));
-                    else addLog("권한 획득했으나 드라이버 없음", "ERR");
                 } else {
                     addLog("USB 권한 거부됨", "ERR");
                 }
