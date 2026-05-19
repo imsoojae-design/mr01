@@ -40,7 +40,11 @@ public class MainActivity extends AppCompatActivity {
 
     private UsbManager       usbManager;
     private UsbSerialPort    serialPort;
-    private ExecutorService  executor;
+
+    // 읽기/쓰기 스레드 분리
+    private final ExecutorService readExecutor  = Executors.newSingleThreadExecutor();
+    private final ExecutorService writeExecutor = Executors.newSingleThreadExecutor();
+
     private final Handler    mainHandler = new Handler(Looper.getMainLooper());
     private final Handler    autoHandler = new Handler(Looper.getMainLooper());
     private Runnable         autoRunnable;
@@ -57,7 +61,6 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
         instance   = this;
         usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
-        executor   = Executors.newSingleThreadExecutor();
         setupViewPager();
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
@@ -86,7 +89,7 @@ public class MainActivity extends AppCompatActivity {
         List<UsbSerialDriver> drivers =
             UsbSerialProber.getDefaultProber().findAllDrivers(usbManager);
         if (drivers.isEmpty()) {
-            addLog("USB 장치 없음 — OTG 케이블 확인", "ERR");
+            addLog("USB 장치 없음", "ERR");
             toast("USB 장치를 찾을 수 없습니다");
             return;
         }
@@ -106,15 +109,14 @@ public class MainActivity extends AppCompatActivity {
         openPort(drivers.get(0));
     }
 
-    // ── 포트 열기 ─────────────────────────────────────────
+    // ── 포트 열기 (readExecutor에서 실행) ─────────────────
     private void openPort(UsbSerialDriver driver) {
-        executor.execute(() -> {
+        readExecutor.execute(() -> {
             try {
                 UsbDeviceConnection conn =
                     usbManager.openDevice(driver.getDevice());
                 if (conn == null) {
-                    mainHandler.post(() ->
-                        addLog("장치 열기 실패 (권한 없음)", "ERR"));
+                    mainHandler.post(() -> addLog("장치 열기 실패", "ERR"));
                     return;
                 }
 
@@ -130,8 +132,6 @@ public class MainActivity extends AppCompatActivity {
                 // TX High Level 활성화 (프로토콜 규정)
                 port.setDTR(true);
                 port.setRTS(true);
-
-                // High Level 안정화 대기 20~50ms
                 Thread.sleep(50);
 
                 serialPort  = port;
@@ -143,11 +143,11 @@ public class MainActivity extends AppCompatActivity {
                         + " (" + MeterProtocol.BAUD_RATE + " bps, 8N1)", "OK");
                 });
 
+                // 수신 루프 시작 (readExecutor 계속 사용)
                 startReadLoop();
 
             } catch (IOException | InterruptedException e) {
-                mainHandler.post(() ->
-                    addLog("연결 실패: " + e.getMessage(), "ERR"));
+                mainHandler.post(() -> addLog("연결 실패: " + e.getMessage(), "ERR"));
             }
         });
     }
@@ -168,7 +168,7 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    // ── 수신 루프 ─────────────────────────────────────────
+    // ── 수신 루프 (readExecutor에서 블로킹) ──────────────
     private void startReadLoop() {
         isReading = true;
         byte[] buf    = new byte[256];
@@ -177,7 +177,7 @@ public class MainActivity extends AppCompatActivity {
 
         while (isReading && serialPort != null) {
             try {
-                int n = serialPort.read(buf, 150);
+                int n = serialPort.read(buf, 200);
                 if (n > 0) {
                     System.arraycopy(buf, 0, acc, accLen[0], n);
                     accLen[0] += n;
@@ -194,33 +194,38 @@ public class MainActivity extends AppCompatActivity {
                     if (accLen[0] > 400) accLen[0] = 0;
                 }
             } catch (IOException e) {
-                if (isReading) mainHandler.post(this::disconnectUsb);
-                break;
+                String msg = e.getMessage();
+                if (msg != null && (msg.contains("Broken pipe")
+                        || msg.contains("closed"))) {
+                    mainHandler.post(this::disconnectUsb);
+                    break;
+                }
+                // 타임아웃 등 일시적 오류는 무시하고 계속
             }
         }
     }
 
-    // ── 검침 요청 전송 ─────────────────────────────────────
+    // ── 검침 요청 전송 (writeExecutor에서 실행) ───────────
     public void sendRequest(int addr) {
         if (!isConnected || serialPort == null) {
             toast("먼저 연결하세요");
             return;
         }
+        addLog("검침 요청 준비 중...", "INFO");
+
         byte[] frame = MeterProtocol.buildRequest(addr);
-        executor.execute(() -> {
+
+        // writeExecutor — readExecutor와 별도 스레드
+        writeExecutor.execute(() -> {
             try {
                 // TX High Level 유지
                 serialPort.setRTS(true);
                 serialPort.setDTR(true);
 
-                // 전송 전 High Level 대기 (20~50ms, 프로토콜 규정)
+                // 전송 전 High Level 대기 (20~50ms)
                 Thread.sleep(35);
 
-                // 수신 버퍼 클리어
-                byte[] flush = new byte[64];
-                try { serialPort.read(flush, 30); } catch (IOException ignored) {}
-
-                // 검침 요청 전송
+                // 전송
                 serialPort.write(frame, 3000);
 
                 mainHandler.post(() ->
@@ -228,7 +233,7 @@ public class MainActivity extends AppCompatActivity {
                         + MeterProtocol.toHex(frame), "HEX")
                 );
 
-                // 전송 후 대기 (0~100ms, 프로토콜 규정)
+                // 전송 후 대기 (0~100ms)
                 Thread.sleep(100);
 
             } catch (IOException | InterruptedException e) {
@@ -309,7 +314,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         disconnectUsb();
-        executor.shutdown();
+        readExecutor.shutdown();
+        writeExecutor.shutdown();
         try { unregisterReceiver(usbReceiver); } catch (Exception ignored) {}
         instance = null;
     }
