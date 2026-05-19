@@ -87,31 +87,45 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ── USB 연결 ──────────────────────────────────────────
-    public void connectUsb() {
-        List<UsbSerialDriver> drivers =
-            UsbSerialProber.getDefaultProber().findAllDrivers(usbManager);
-
-        if (drivers.isEmpty()) {
-            addLog("USB 장치 없음 — OTG 케이블 확인", "ERR");
-            toast("USB 장치를 찾을 수 없습니다");
-            return;
-        }
-
-        UsbSerialDriver driver = drivers.get(0);
-        UsbDevice       device = driver.getDevice();
-        addLog("USB 감지: " + device.getProductName()
-            + " VID=" + device.getVendorId()
-            + " PID=" + device.getProductId(), "INFO");
-
-        if (!usbManager.hasPermission(device)) {
-            PendingIntent pi = PendingIntent.getBroadcast(
-                this, 0, new Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE);
-            usbManager.requestPermission(device, pi);
-            addLog("USB 권한 요청 중...", "INFO");
-            return;
-        }
-        openPort(driver);
+    public void sendRequest(int addr) {
+    if (!isConnected || serialPort == null) {
+        toast("먼저 연결하세요");
+        return;
     }
+
+    byte[] frame = MeterProtocol.buildRequest(addr);
+
+    executor.execute(() -> {
+        try {
+            // 1. TX High Level 유지 (RTS=High)
+            serialPort.setRTS(true);
+            serialPort.setDTR(true);
+
+            // 2. 20~50ms 대기 (프로토콜 규정)
+            Thread.sleep(35);
+
+            // 3. 수신 버퍼 클리어
+            byte[] flush = new byte[64];
+            try { serialPort.read(flush, 30); } catch (IOException ignored) {}
+
+            // 4. Start bit 전송
+            serialPort.write(frame, 3000);
+
+            mainHandler.post(() ->
+                addLog("→ REQ_UD2 (주소 " + addr + "): "
+                    + MeterProtocol.toHex(frame), "HEX")
+            );
+
+            // 5. 전송 완료 후 0~100ms 대기
+            Thread.sleep(100);
+
+        } catch (IOException | InterruptedException e) {
+            mainHandler.post(() ->
+                addLog("전송 실패: " + e.getMessage(), "ERR")
+            );
+        }
+    });
+}
 
     // ── 포트 열기 ─────────────────────────────────────────
     private void openPort(UsbSerialDriver driver) {
@@ -133,8 +147,10 @@ public class MainActivity extends AppCompatActivity {
                 );
 
                 // 포트 안정화 대기
-                Thread.sleep(200);
-
+                port.setDTR(true);
+                port.setRTS(true);
+                Thread.sleep(50);       
+                // High level 안정화
                 serialPort  = port;
                 isConnected = true;
 
