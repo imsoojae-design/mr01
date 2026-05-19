@@ -11,6 +11,7 @@ import android.hardware.usb.UsbManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -40,6 +41,7 @@ public class MainActivity extends AppCompatActivity {
 
     private UsbManager       usbManager;
     private UsbSerialPort    serialPort;
+    private TextView         tvConnStatus;
 
     // 읽기/쓰기 스레드 분리
     private final ExecutorService readExecutor  = Executors.newSingleThreadExecutor();
@@ -51,6 +53,9 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean isConnected = false;
     private volatile boolean isReading   = false;
 
+    // 상태 enum
+    enum ConnState { DISCONNECTED, CONNECTED_IDLE, CONNECTED_OK }
+
     private ReadFragment readFragment;
     private HexFragment  hexFragment;
     private LogFragment  logFragment;
@@ -59,13 +64,39 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        instance   = this;
-        usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        instance      = this;
+        usbManager    = (UsbManager) getSystemService(Context.USB_SERVICE);
+        tvConnStatus  = findViewById(R.id.tvConnStatus);
         setupViewPager();
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        setConnState(ConnState.DISCONNECTED);
+    }
+
+    // ── 상태 표시 ─────────────────────────────────────────
+    private void setConnState(ConnState state) {
+        mainHandler.post(() -> {
+            if (tvConnStatus == null) return;
+            switch (state) {
+                case DISCONNECTED:
+                    tvConnStatus.setText("● 연결 안됨");
+                    tvConnStatus.setTextColor(getColor(R.color.muted));
+                    tvConnStatus.setBackgroundResource(R.drawable.bg_pill_gray);
+                    break;
+                case CONNECTED_IDLE:
+                    tvConnStatus.setText("● 연결됨");
+                    tvConnStatus.setTextColor(getColor(R.color.yellow));
+                    tvConnStatus.setBackgroundResource(R.drawable.bg_pill_gray);
+                    break;
+                case CONNECTED_OK:
+                    tvConnStatus.setText("● 검침 완료");
+                    tvConnStatus.setTextColor(getColor(R.color.green));
+                    tvConnStatus.setBackgroundResource(R.drawable.bg_pill_green);
+                    break;
+            }
+        });
     }
 
     private void setupViewPager() {
@@ -109,7 +140,6 @@ public class MainActivity extends AppCompatActivity {
         openPort(drivers.get(0));
     }
 
-    // ── 포트 열기 (readExecutor에서 실행) ─────────────────
     private void openPort(UsbSerialDriver driver) {
         readExecutor.execute(() -> {
             try {
@@ -119,7 +149,6 @@ public class MainActivity extends AppCompatActivity {
                     mainHandler.post(() -> addLog("장치 열기 실패", "ERR"));
                     return;
                 }
-
                 UsbSerialPort port = driver.getPorts().get(0);
                 port.open(conn);
                 port.setParameters(
@@ -128,8 +157,6 @@ public class MainActivity extends AppCompatActivity {
                     UsbSerialPort.STOPBITS_1,
                     UsbSerialPort.PARITY_NONE
                 );
-
-                // TX High Level 활성화 (프로토콜 규정)
                 port.setDTR(true);
                 port.setRTS(true);
                 Thread.sleep(50);
@@ -137,13 +164,14 @@ public class MainActivity extends AppCompatActivity {
                 serialPort  = port;
                 isConnected = true;
 
+                // USB 연결됨 — 아직 검침 전이므로 IDLE 상태
+                setConnState(ConnState.CONNECTED_IDLE);
                 mainHandler.post(() -> {
                     if (readFragment != null) readFragment.onConnected(true);
                     addLog("연결됨: " + driver.getDevice().getProductName()
                         + " (" + MeterProtocol.BAUD_RATE + " bps, 8N1)", "OK");
                 });
 
-                // 수신 루프 시작 (readExecutor 계속 사용)
                 startReadLoop();
 
             } catch (IOException | InterruptedException e) {
@@ -152,7 +180,6 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    // ── 연결 해제 ─────────────────────────────────────────
     public void disconnectUsb() {
         stopAutoTimer();
         isReading   = false;
@@ -162,13 +189,13 @@ public class MainActivity extends AppCompatActivity {
         if (p != null) {
             try { p.close(); } catch (IOException ignored) {}
         }
+        setConnState(ConnState.DISCONNECTED);
         mainHandler.post(() -> {
             if (readFragment != null) readFragment.onConnected(false);
             addLog("연결 해제", "WARN");
         });
     }
 
-    // ── 수신 루프 (readExecutor에서 블로킹) ──────────────
     private void startReadLoop() {
         isReading = true;
         byte[] buf    = new byte[256];
@@ -200,40 +227,32 @@ public class MainActivity extends AppCompatActivity {
                     mainHandler.post(this::disconnectUsb);
                     break;
                 }
-                // 타임아웃 등 일시적 오류는 무시하고 계속
             }
         }
     }
 
-    // ── 검침 요청 전송 (writeExecutor에서 실행) ───────────
     public void sendRequest(int addr) {
         if (!isConnected || serialPort == null) {
             toast("먼저 연결하세요");
             return;
         }
-        addLog("검침 요청 준비 중...", "INFO");
-
+        addLog("검침 요청 전송 중...", "INFO");
         byte[] frame = MeterProtocol.buildRequest(addr);
 
-        // writeExecutor — readExecutor와 별도 스레드
         writeExecutor.execute(() -> {
             try {
-                // TX High Level 유지
                 serialPort.setRTS(true);
                 serialPort.setDTR(true);
-
-                // 전송 전 High Level 대기 (20~50ms)
                 Thread.sleep(35);
 
-                // 전송
-                serialPort.write(frame, 3000);
+                byte[] flush = new byte[64];
+                try { serialPort.read(flush, 30); } catch (IOException ignored) {}
 
+                serialPort.write(frame, 3000);
                 mainHandler.post(() ->
                     addLog("→ REQ_UD2 (주소 " + addr + "): "
                         + MeterProtocol.toHex(frame), "HEX")
                 );
-
-                // 전송 후 대기 (0~100ms)
                 Thread.sleep(100);
 
             } catch (IOException | InterruptedException e) {
@@ -244,7 +263,6 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    // ── 자동 반복 ─────────────────────────────────────────
     public void setAutoInterval(int ms, int addr) {
         stopAutoTimer();
         if (ms > 0) {
@@ -264,10 +282,13 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ── 결과 처리 ─────────────────────────────────────────
     public void handleResult(MeterProtocol.ParseResult r) {
         if (!r.ok) { addLog("파싱 오류: " + r.error, "ERR"); return; }
         history.add(0, r);
+
+        // 검침 성공 → 헤더 상태 "검침 완료"로 변경
+        setConnState(ConnState.CONNECTED_OK);
+
         if (readFragment != null) readFragment.updateReading(r);
         addLog("[" + r.timestamp + "] "
             + r.meterNo + " = " + r.readingFmt() + " ㎥ | "
@@ -276,7 +297,6 @@ public class MainActivity extends AppCompatActivity {
             r.hasWarning() ? "WARN" : "OK");
     }
 
-    // ── 로그 ─────────────────────────────────────────────
     public void addLog(String msg, String level) {
         mainHandler.post(() -> {
             if (logFragment != null) logFragment.addLog(msg, level);
@@ -289,7 +309,6 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, m, Toast.LENGTH_SHORT).show();
     }
 
-    // ── USB BroadcastReceiver ─────────────────────────────
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         public void onReceive(Context ctx, Intent intent) {
             String action = intent.getAction();
